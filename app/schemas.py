@@ -71,6 +71,63 @@ class DelayReportAliasIn(DelayReportIn):
     group_id: int = Field(..., ge=1, description="被报告的已出发人群组编号")
 
 
+# --------------------------------------------------------------------------
+# 人工救援队与救援任务
+# --------------------------------------------------------------------------
+
+class RescueTeamIn(BaseModel):
+    """人工救援队登记：唯一编号 + 正整数载员量。"""
+    team_id: int = Field(..., ge=1, description="救援队唯一编号（正整数）")
+    capacity: int = Field(..., gt=0, description="载员量（正整数）")
+
+
+class RescueTeamOut(BaseModel):
+    team_id: int
+    capacity: int
+    # 当前进行中任务编号；空闲为 null
+    task_id: Optional[int] = None
+
+
+class RescueTeamListOut(BaseModel):
+    current_minute: int
+    teams: list[RescueTeamOut]
+
+
+class RescueDispatchIn(BaseModel):
+    """人工救援派遣：组号、队号、滞留节点、所见当前分钟。"""
+    group_id: int = Field(..., ge=1, description="待救援人群组编号")
+    team_id: int = Field(..., ge=1, description="人工救援队编号")
+    node_id: int = Field(..., ge=0, description="该组当前滞留的节点编号")
+    observed_minute: int = Field(
+        ..., ge=0, description="提交时所见的当前分钟（须与实际当前分钟一致）")
+
+
+class RescueCompletionIn(BaseModel):
+    """救援结案：既有出口编号与实际送达分钟。"""
+    exit_id: int = Field(..., ge=0, description="实际送达的既有出口编号")
+    delivery_minute: int = Field(
+        ..., ge=0, description="实际送达分钟（不早于派遣、不晚于当前分钟）")
+
+
+class RescueTaskOut(BaseModel):
+    task_id: int
+    group_id: int
+    team_id: int
+    node_id: int = Field(description="派遣时组的滞留节点")
+    observed_minute: int = Field(description="派遣提交时所见当前分钟")
+    dispatch_minute: int = Field(description="实际受理派遣的当前分钟")
+    status: str = Field(description="in_progress=救援中 | completed=已核销")
+    # 结案后给出的实际出口与实际送达分钟；进行中为 null
+    exit_id: Optional[int] = Field(None, description="实际送达出口（结案后）")
+    delivery_minute: Optional[int] = Field(
+        None, description="实际送达分钟（结案后）")
+
+
+class RescueTaskListOut(BaseModel):
+    current_minute: int
+    tasks: list[RescueTaskOut]
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")
@@ -143,6 +200,15 @@ class GroupPlanOut(BaseModel):
     prefix_step_count: Optional[int] = None
     reason: Optional[str] = None
     detail: Optional[str] = None
+    # ---- 人工救援队交接（仅被派遣/已核销的组给出，其余恒为 null）----
+    # rescuing=已派遣、人工救援中；rescued=已结案核销送达
+    rescue_task_id: Optional[int] = Field(
+        None, description="进行中或已核销的人工救援任务编号")
+    rescue_team_id: Optional[int] = Field(None, description="接手的救援队编号")
+    rescued_exit_id: Optional[int] = Field(
+        None, description="结案单列的实际送达出口（非规划到达，rescued 时给出）")
+    delivery_minute: Optional[int] = Field(
+        None, description="结案单列的实际送达分钟（可晚于原截止，rescued 时给出）")
 
 
 class PlanResponse(BaseModel):
@@ -181,7 +247,9 @@ class RevisionSummaryOut(BaseModel):
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
                     "group-corrections=纠正人群组 | closures=登记封闭 | "
                     "capacity-controls=登记容量管制 | "
-                    "delay-reports=现场报告节点滞留 | tick=时间推进")
+                    "delay-reports=现场报告节点滞留 | "
+                    "rescue-dispatches=派遣人工救援 | "
+                    "rescue-completions=救援结案核销 | tick=时间推进")
     minute: int = Field(description="该修订提交后的当前分钟")
     detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
 

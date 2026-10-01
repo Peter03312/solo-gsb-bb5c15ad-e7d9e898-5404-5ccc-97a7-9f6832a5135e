@@ -11,6 +11,10 @@
 支持现场指挥按组号、所在节点、预计恢复分钟报告已出发组的**节点滞留**：
 保留已走前缀、释放该组从当前分钟起的旧预约并从滞留节点重找余程，无余程
 则标记**待救援**，其他未出发组随之整体重排。
+支持按唯一编号与正整数载员量**登记人工救援队**，现场指挥可把待救援组
+**交接派遣**给空闲队伍（校验所见分钟、滞留节点、载员量、队伍空闲），
+随后凭任务号与既有出口、实际送达分钟**结案核销**：成功派遣/结案与编排
+修订在同一事务原子落库，实际出口与时刻单列、不当作规划到达。
 每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
 供指挥员追溯"每次疏散变更为何改动编排"。
 
@@ -60,7 +64,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回当前分钟 |
-| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制 |
+| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务（旧修订保留） |
 | GET | `/plan` | 查询每组路线、出发/到达分钟或无法安排的原因 |
 | POST | `/groups` | 新增一组或多组，**仅重排未出发组** |
 | POST | `/group-corrections` | 批量纠正未出发组的属性（非空清单，整批原子生效）；目标组已出发则 **409 整批拒绝** |
@@ -68,6 +72,12 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/capacity-controls` | 登记左闭右开容量管制时段；重叠或使已出发组超载则 **409 整次拒绝** |
 | GET | `/capacity-controls` | 列出当前全部容量管制时段 |
 | POST | `/groups/{group_id}/delay-report` | 现场报告已出发组在某节点滞留（按节点+恢复分钟重找余程）；组未出发、节点或时机不符 **409 整次拒绝** |
+| POST | `/rescue-teams` | 登记人工救援队（唯一编号+正整数载员量）；编号重复 **409 整次拒绝** |
+| GET | `/rescue-teams` | 列出全部救援队（载员量、当前进行中任务号） |
+| POST | `/rescue-tasks` | 把待救援组派遣给人工救援队（组号/队号/滞留节点/所见分钟）；分钟失步、状态或节点不符、超载、队伍忙均 **409 整次拒绝** |
+| GET | `/rescue-tasks` | 列出全部救援任务，可加 `?status=in_progress|completed` |
+| GET | `/rescue-tasks/{task_id}` | 查询单个任务当前状态；未知任务号 **404** |
+| POST | `/rescue-tasks/{task_id}/completion` | 结案核销（既有出口+实际送达分钟）；重复结案/送达时序冲突 **409** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用与各分钟有效上限，可加 `?minute=n` |
 | GET | `/revisions` | 列出全部修订（修订号/触发操作/当时分钟），重置与重启后保留 |
@@ -188,6 +198,57 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+**人工救援队登记 / 派遣 / 结案核销**
+
+* `POST /rescue-teams` 登记救援队：`{"team_id": 1, "capacity": 12}`。
+  编号须为正整数且全库唯一，载员量为正整数；重复登记返回 409
+  `RESCUE_TEAM_ALREADY_REGISTERED`（`reason=DUPLICATE_TEAM_ID`），原队伍
+  载员量不变。登记不改编排、不产生修订；`GET /rescue-teams` 返回各队
+  载员量与其当前进行中任务号（空闲为 `null`）。
+* `POST /rescue-tasks` 派遣：请求体为
+  `{"group_id": 1, "team_id": 1, "node_id": 2, "observed_minute": 4}`。
+  **仅当**下列条件全部成立时受理（HTTP 201，返回任务号）：
+
+  1. 所见当前分钟 `observed_minute` 恰为服务端当前分钟（分钟未变）；
+  2. 该组状态仍为 `awaiting_rescue`，且其待救援滞留节点就是 `node_id`；
+  3. 组人数不超过队伍载员量；
+  4. 队伍空闲、同组同队均无进行中任务（各只允许一项）。
+
+  受理后组标记 `rescuing`（救援中）：**保留已走通道前缀**，不写入任何
+  未来通道占用；时间推进不自动重排该组；其既有节点滞留报告接口被拒绝
+  （409 `GROUP_RESCUING`），组纠正同样拒绝。拒绝统一返回 409
+  `RESCUE_DISPATCH_NOT_ACCEPTABLE`，`conflicts[0].reason` 区分：
+
+  | reason | 触发条件 |
+  | --- | --- |
+  | `OBSERVED_MINUTE_STALE` | 所见分钟与当前分钟不一致（含并发 `/tick` 抢占） |
+  | `GROUP_NOT_AWAITING_RESCUE` | 组不在待救援状态（未出发/已出发等） |
+  | `GROUP_RESCUE_IN_PROGRESS` | 该组已有进行中救援任务 |
+  | `GROUP_ALREADY_RESCUED` | 该组已由人工结案送达，不可再派 |
+  | `NODE_MISMATCH` | 滞留节点不符（响应给 `expected_node_id`） |
+  | `TEAM_CAPACITY_EXCEEDED` | 组人数超队伍载员量（附 `group_size`/`team_capacity`） |
+  | `TEAM_BUSY` | 队伍已有进行中任务（附 `current_task_id`） |
+
+  无效组号/队号返回 422；任何拒绝均整次不改编排、不产生修订。成功派遣
+  原子写入一条 `rescue-dispatches` 修订。
+* 任务查询：`GET /rescue-tasks/{task_id}` 返回单个任务（未知任务号
+  404）；`GET /rescue-tasks` 列出全部任务，可加
+  `?status=in_progress|completed` 过滤（其他取值 422）。
+* `POST /rescue-tasks/{task_id}/completion` 结案：请求体为
+  `{"exit_id": 6, "delivery_minute": 8}`。`exit_id` 必须是当前场景的
+  **既有出口**（否则 422）；实际送达分钟须**不早于派遣分钟且不晚于当前
+  分钟**（与派遣分钟相等允许；晚于该组原规划截止也**如实记录**）。成功
+  后任务置 `completed`、队伍立即释放空闲，组标记 `rescued`（已救援），
+  实际出口与送达时刻在任务及编排中单列（`rescued_exit_id` /
+  `delivery_minute`），**不**回写规划到达字段（`exit_id` /
+  `arrival_minute` 保持为空，人工送达不当作规划到达）。成功结案原子写入
+  一条 `rescue-completions` 修订。时序/状态冲突统一返回 409
+  `RESCUE_COMPLETION_NOT_ACCEPTABLE`，`conflicts[0].reason` 区分
+  `TASK_ALREADY_COMPLETED`（附首次结案的出口与分钟）、
+  `DELIVERY_BEFORE_DISPATCH`、`DELIVERY_IN_FUTURE`；未知任务号 404。
+* **场景重置**（`POST /scenario`）清空全部救援队与救援任务；旧修订保留、
+  修订号继续递增，重置后可重新登记同编号队伍。
+
 ### 响应（GET /plan 与所有变更接口）
 
 ```json
@@ -214,7 +275,16 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 组状态：`scheduled`（已安排未出发）、`fixed`（已出发，路线与占用固定）、
 `awaiting_rescue`（已出发但现场报告后截止前再无可行余程，待救援；后续
-时间推进不自动重排）、`failed`（从未出发且无法在截止前安排）。
+时间推进不自动重排）、`rescuing`（待救援组已交接人工救援队、救援中；
+保留已走前缀、无未来通道占用、不自动重排）、`rescued`（已由人工救援队
+结案送达；实际出口与时刻单列，不作规划到达）、`failed`（从未出发且无法
+在截止前安排）。
+
+被人工救援队交接过的组（`rescuing`/`rescued`）在编排中额外给出：
+`rescue_task_id`（救援任务号）、`rescue_team_id`（接手队伍）、
+`rescued_exit_id`（结案单列的实际送达出口，仅 `rescued`）、
+`delivery_minute`（结案单列的实际送达分钟，仅 `rescued`）；未交接组这些
+字段恒为 `null`，原有字段语义保持兼容。
 
 被现场滞留报告影响过的组（`fixed` 或 `awaiting_rescue`）额外给出
 `prefix_step_count`：`steps` 的前 `prefix_step_count` 段为报告时已走完、
@@ -304,12 +374,13 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 修订历史（变更追溯）
 
 场景重置、新增人群组、纠正人群组、登记封闭、登记容量管制、现场节点滞留
-报告、时间推进**成功**时，各产生一条修订：全局递增修订号（按实际提交
-顺序编号）、触发操作及参数摘要、提交后的当前分钟、提交前后完整编排快照。
-**被拒绝的请求（409/422）不产生修订。**修订和编排变更在同一 SQLite
-事务提交，查询不会看到只写入一方的状态；场景重置与服务重启后历史保留、
-编号继续递增。快照为落库时的完整编排（含当时固定组状态与逐段通行时刻），
-按原样返回，不按当前场景重算。
+报告、**人工救援派遣与结案核销**、时间推进**成功**时，各产生一条修订：
+全局递增修订号（按实际提交顺序编号）、触发操作及参数摘要、提交后的当前
+分钟、提交前后完整编排快照。**被拒绝的请求（409/422）不产生修订。**修订
+和编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；场景
+重置与服务重启后历史保留、编号继续递增。快照为落库时的完整编排（含当时
+固定组、救援中/已救援组状态与逐段通行时刻），按原样返回，不按当前场景
+重算。救援队登记本身不改编排，不产生修订。
 
 **GET /revisions**
 
@@ -327,12 +398,17 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 `operation`：`scenario`（场景重置）/ `groups`（新增人群组）/
 `group-corrections`（纠正人群组）/ `closures`（登记封闭）/
 `capacity-controls`（登记容量管制）/ `delay-reports`（现场节点滞留
-报告）/ `tick`（时间推进）。
+报告）/ `rescue-dispatches`（人工救援派遣）/
+`rescue-completions`（救援结案核销）/ `tick`（时间推进）。
 纠正类修订的 `detail` 逐项记录纠正前后的字段值，形如
 `{"corrections": [{"group_id": 3, "changed_fields": ["size"],
 "before": {...}, "after": {...}}]}`；节点滞留报告的 `detail` 形如
 `{"group_id": 1, "node_id": 2, "recovery_minute": 6, "outcome": "resumed",
-"prefix_step_count": 1}`。
+"prefix_step_count": 1}`；派遣修订形如
+`{"task_id": 1, "group_id": 1, "team_id": 1, "node_id": 2,
+"observed_minute": 4, "dispatch_minute": 4}`；结案修订形如
+`{"task_id": 1, "group_id": 1, "team_id": 1, "exit_id": 6,
+"delivery_minute": 8, "dispatch_minute": 4}`。
 
 **GET /revisions/{rev}**
 
@@ -358,8 +434,9 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 每组差异 `change`：`added`（新增，`before` 为 null）/ `removed`
 （移除，`after` 为 null）/ `changed`（`changed_fields` 列出变化的字段，
 `before`/`after` 给出状态、出发与到达分钟、路线、逐段时刻、已走前缀步数
-`prefix_step_count`、失败原因的前后完整值）。未知修订号返回 HTTP 404
-`{"detail": "修订号 N 不存在"}`。
+`prefix_step_count`、失败原因及人工救援字段
+`rescue_task_id/rescue_team_id/rescued_exit_id/delivery_minute` 的前后完整
+值）。未知修订号返回 HTTP 404 `{"detail": "修订号 N 不存在"}`。
 
 ## 4. 调用示例
 
@@ -392,6 +469,25 @@ curl -s http://localhost:8000/passages/1/load | python3 -m json.tool
 curl -s -X POST http://localhost:8000/groups/1/delay-report \
   -H 'Content-Type: application/json' \
   -d '{"node_id": 2, "recovery_minute": 6}' | python3 -m json.tool
+
+# 登记一支载员量 12 的人工救援队
+curl -s -X POST http://localhost:8000/rescue-teams \
+  -H 'Content-Type: application/json' \
+  -d '{"team_id": 1, "capacity": 12}'
+
+# 把待救援组 1（滞留节点 2、所见当前分钟 6）派遣给救援队 1
+curl -s -X POST http://localhost:8000/rescue-tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 1, "node_id": 2, "observed_minute": 6}' \
+  | python3 -m json.tool
+
+# 查询任务 1 当前状态
+curl -s http://localhost:8000/rescue-tasks/1 | python3 -m json.tool
+
+# 结案核销：实际由出口 6 在第 8 分钟送达
+curl -s -X POST http://localhost:8000/rescue-tasks/1/completion \
+  -H 'Content-Type: application/json' \
+  -d '{"exit_id": 6, "delivery_minute": 8}' | python3 -m json.tool
 ```
 
 ## 5. 编排语义（约定）
@@ -415,7 +511,8 @@ curl -s -X POST http://localhost:8000/groups/1/delay-report \
    立即视为已出发（`fixed`），路线与容量占用永久固定；其余未出发组
    （含此前失败的组）以当前分钟为最早出发时间整体重排。被现场报告置为
    待救援（`awaiting_rescue`）的组不参与重排，时间推进不会自动为其
-   重新规划。
+   重新规划；已交接人工救援（`rescuing`）与已人工送达（`rescued`）的
+   组同样不参与重排，由救援派遣/结案接口管理。
 7. **增量变更**：新增人群组或封闭时只重排未出发组；重排在单个 SQLite
    事务内“先整体删除旧路线、再写入新路线”，不会留下部分重排。
 8. **组纠正**：纠正清单整批校验、整批生效——任一项目标组不存在、
@@ -432,11 +529,12 @@ curl -s -X POST http://localhost:8000/groups/1/delay-report \
    清除全部管制记录。
 11. **并发**：全部变更接口由同一把异步互斥锁串行化，容量逐组累加校验，
     并发变更不会超用容量。
-12. **修订**：七类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
-    现场节点滞留报告/推进时间）成功时，在同一事务内追加修订记录（全局
-    递增修订号、触发操作、当时分钟、前后完整编排快照）；被拒绝的请求不
-    产生修订。修订不随场景重置或服务重启丢失，历史快照按落库内容原样
-    返回，不按当前场景重算。
+12. **修订**：九类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
+    现场节点滞留报告/人工救援派遣/救援结案核销/推进时间）成功时，在同一
+    事务内追加修订记录（全局递增修订号、触发操作、当时分钟、前后完整
+    编排快照）；被拒绝的请求不产生修订，救援队登记也不产生修订。修订不
+    随场景重置或服务重启丢失，历史快照按落库内容原样返回，不按当前场景
+    重算。
 13. **现场节点滞留报告**：仅当该组按现行计划已到达所报节点、尚未进入
     下一通道且未抵达出口时受理（下一通道进入分钟 == 当前分钟仍视为在
     节点；恢复分钟不得早于当前分钟）；组未出发、节点或时机不符一律拒绝
@@ -448,12 +546,24 @@ curl -s -X POST http://localhost:8000/groups/1/delay-report \
     随之整体重排，其他已出发组路线与占用不变。待救援组不参与后续时间
     推进的自动重排，只能在其滞留节点由新的报告重新受理；当前编排以
     `prefix_step_count` 区分已走前缀与新余程。
+14. **人工救援队交接**：救援队按唯一正整数编号与正整数载员量登记，重复
+    登记整次拒绝。派遣提交组号、队号、滞留节点与所见当前分钟，仅当所见
+    分钟未变、组仍在该节点处于 `awaiting_rescue`、人数不超载员量、队伍
+    空闲且同组同队各无进行中任务时受理并返回任务号；任一条件不符（无效
+    编号、状态/时序冲突、并发时间推进抢占）整次拒绝，不改编排与修订。
+    受理后组置 `rescuing`：保留已走通道前缀、不产生未来通道占用、不参与
+    时间推进自动重排，其节点滞留报告与组纠正被拒绝。结案提交任务号、
+    **既有出口编号**与实际送达分钟，送达分钟须不早于派遣且不晚于当前
+    分钟（晚于原截止如实记录）；成功后队伍释放、组置 `rescued`，实际
+    出口与时刻单列（不回写规划到达字段）。成功派遣与结案均与修订在同一
+    事务原子写入。场景重置清空全部救援队与任务，旧修订保留、编号继续
+    递增。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑、现场滞留报告、修订记录与差异
+  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑、现场滞留报告、人工救援队派遣/结案、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
   db.py         SQLite 建表、世界状态加载、整组事务化持久化、滞留报告与修订落库
   schemas.py    Pydantic 输入/输出模型

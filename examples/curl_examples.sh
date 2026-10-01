@@ -3,7 +3,7 @@
 # 用法： bash examples/curl_examples.sh [BASE_URL]
 # 依次演示：初始化、新增组、新增封闭、推进分钟、409 拒绝、容量管制登记/
 # 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
-# 修订追溯。
+# 人工救援队登记/派遣拒绝/派遣受理/结案核销、修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -183,16 +183,97 @@ say "25) 时间推进不自动重排待救援组（仍为 awaiting_rescue，只�
 curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
   -d '{"minutes": 6}' | python3 -m json.tool
 
-say "26) 列出修订历史（节点滞留报告成功各一条 delay-reports，被拒绝的不产生）"
+# ---- 人工救援队：登记 / 派遣 / 结案核销 ----
+say "26) 登记人工救援队（队1载员10；重复编号预期 HTTP 409 整次拒绝）"
+curl -s -X POST "$BASE/rescue-teams" -H 'Content-Type: application/json' \
+  -d '{"team_id": 1, "capacity": 10}' | python3 -m json.tool
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-teams" \
+  -H 'Content-Type: application/json' \
+  -d '{"team_id": 1, "capacity": 20}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -X POST "$BASE/rescue-teams" -H 'Content-Type: application/json' \
+  -d '{"team_id": 2, "capacity": 5}' > /dev/null
+
+say "27) 列出救援队（两队均空闲，task_id 为 null）"
+curl -s "$BASE/rescue-teams" | python3 -m json.tool
+
+say "28) 派遣校验：节点不符 409 NODE_MISMATCH（组1实际滞留节点2）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 1, "node_id": 1, "observed_minute": 10}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "29) 派遣校验：队2载员5小于组人数10 -> 409 TEAM_CAPACITY_EXCEEDED"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 2, "node_id": 2, "observed_minute": 10}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "30) 派遣校验：所见分钟10与当前分钟一致；再演示失步（observed 9 -> 409）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 1, "node_id": 2, "observed_minute": 9}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "31) 正式派遣：组1在节点2交给队1（当前分钟10），返回任务号；组置 rescuing"
+curl -s -X POST "$BASE/rescue-tasks" -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 1, "node_id": 2, "observed_minute": 10}' \
+  | python3 -m json.tool
+
+say "32) 同组重复派遣 / 队伍忙：组1再派（即使换队2）-> 409 GROUP_RESCUE_IN_PROGRESS"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 2, "node_id": 2, "observed_minute": 10}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "33) 救援中的组拒绝既有滞留报告（409 GROUP_RESCUING）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/groups/1/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 12}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "34) 查询任务1（in_progress）与任务列表（?status=in_progress 过滤）"
+curl -s "$BASE/rescue-tasks/1" | python3 -m json.tool
+curl -s "$BASE/rescue-tasks?status=in_progress" | python3 -m json.tool
+
+say "35) 结案时序：送达12晚于当前10 -> 409 DELIVERY_IN_FUTURE；非既有出口7 -> 422"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks/1/completion" \
+  -H 'Content-Type: application/json' \
+  -d '{"exit_id": 6, "delivery_minute": 12}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks/1/completion" \
+  -H 'Content-Type: application/json' \
+  -d '{"exit_id": 7, "delivery_minute": 10}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "36) 推进到第12分钟，结案核销：出口6、实际送达12（晚于原截止也如实记录）"
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 2}' > /dev/null
+curl -s -X POST "$BASE/rescue-tasks/1/completion" -H 'Content-Type: application/json' \
+  -d '{"exit_id": 6, "delivery_minute": 12}' | python3 -m json.tool
+
+say "37) 结案后：组为 rescued（实际出口/时刻单列，规划到达字段为空），队1空闲"
+curl -s "$BASE/plan" | python3 -m json.tool
+curl -s "$BASE/rescue-teams" | python3 -m json.tool
+
+say "38) 重复结案 -> 409 TASK_ALREADY_COMPLETED；已救援组再派 -> 409"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/rescue-tasks/1/completion" \
+  -H 'Content-Type: application/json' \
+  -d '{"exit_id": 6, "delivery_minute": 12}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "39) 列出修订历史（派遣与结案各一条 rescue-* 修订，被拒绝的不产生）"
 curl -s "$BASE/revisions" | python3 -m json.tool
 
-say "27) 按修订号查询：待救援修订的快照与逐组差异（取最新一条）"
+say "40) 按修订号查询：取最新一条（rescue-completions）的快照与逐组差异"
 LATEST=$(curl -s "$BASE/revisions" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["revisions"][-1]["rev"])')
 curl -s "$BASE/revisions/$LATEST" | python3 -m json.tool
 
-say "28) 查询未知修订号（预期 HTTP 404）"
+say "41) 查询未知修订号与未知任务号（预期 HTTP 404）"
 curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999"
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/rescue-tasks/999999"
 python3 -m json.tool /tmp/resp.json || true
 
 say "完成。交互文档： $BASE/docs"

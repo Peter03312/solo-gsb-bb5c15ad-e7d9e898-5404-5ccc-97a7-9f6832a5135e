@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS groups (
     earliest_departure INTEGER NOT NULL,
     priority           INTEGER NOT NULL,
     deadline           INTEGER NOT NULL,
-    -- pending | scheduled | fixed | failed | awaiting_rescue
+    -- pending | scheduled | fixed | failed | awaiting_rescue |
+    -- rescuing | rescued
     status             TEXT NOT NULL,
     departure_minute   INTEGER,
     arrival_minute     INTEGER,
@@ -80,6 +81,34 @@ CREATE TABLE IF NOT EXISTS delay_reports (
     prefix_step_count INTEGER NOT NULL
 );
 
+-- 人工救援队：按唯一编号登记，capacity 为正整数载员量。
+-- 队伍是否空闲由 rescue_tasks 中是否存在该队 in_progress 任务决定。
+CREATE TABLE IF NOT EXISTS rescue_teams (
+    id       INTEGER PRIMARY KEY,
+    capacity INTEGER NOT NULL
+);
+
+-- 人工救援任务：派遣成功产生一条 in_progress 任务；结案核销后置为
+-- completed。同组同队各只允许一项进行中任务（部分唯一索引兜底，
+-- 常规判定由服务层在互斥锁内完成）。
+CREATE TABLE IF NOT EXISTS rescue_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        INTEGER NOT NULL,
+    team_id         INTEGER NOT NULL,
+    node_id         INTEGER NOT NULL,   -- 派遣时组的滞留节点
+    observed_minute INTEGER NOT NULL,   -- 派遣提交时所见当前分钟
+    dispatch_minute INTEGER NOT NULL,   -- 实际受理派遣的当前分钟
+    status          TEXT NOT NULL,      -- in_progress | completed
+    exit_id         INTEGER,            -- 结案：既有出口编号
+    delivery_minute INTEGER             -- 结案：实际送达分钟
+);
+
+-- 同组同队各只允许一项进行中任务（并发抢占的数据库层兜底）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_group
+    ON rescue_tasks(group_id) WHERE status='in_progress';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_team
+    ON rescue_tasks(team_id) WHERE status='in_progress';
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
 -- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
@@ -88,7 +117,8 @@ CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
                                       -- closures | capacity-controls |
-                                      -- delay-reports | tick
+                                      -- delay-reports | rescue-dispatches |
+                                      -- rescue-completions | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
     plan_before TEXT NOT NULL,        -- JSON：提交前完整编排（PlanResponse）
@@ -110,7 +140,9 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    for table in ("delay_reports", "route_steps", "groups", "closures",
+    # 人工救援队与其救援任务随场景重置清空；修订历史不在清空之列
+    for table in ("rescue_tasks", "rescue_teams",
+                  "delay_reports", "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
@@ -309,6 +341,124 @@ async def upsert_delay_report(db: aiosqlite.Connection, *, group_id: int,
                prefix_step_count=excluded.prefix_step_count""",
         (group_id, node_id, recovery_minute, reported_minute,
          prefix_step_count))
+
+
+# --------------------------------------------------------------------------
+# 人工救援队与救援任务
+# --------------------------------------------------------------------------
+
+async def insert_rescue_team(db: aiosqlite.Connection, *, team_id: int,
+                             capacity: int) -> None:
+    """登记一支人工救援队（调用方负责事务与编号查重）。"""
+    await db.execute(
+        "INSERT INTO rescue_teams(id, capacity) VALUES(?,?)",
+        (team_id, capacity))
+
+
+async def load_rescue_teams(db: aiosqlite.Connection) -> list[dict]:
+    """列出全部人工救援队，并附当前进行中任务编号（空闲为 null）。"""
+    async with db.execute(
+            """SELECT t.id, t.capacity, r.id AS task_id
+               FROM rescue_teams t
+               LEFT JOIN rescue_tasks r
+                      ON r.team_id=t.id AND r.status='in_progress'
+               ORDER BY t.id""") as cur:
+        rows = await cur.fetchall()
+    return [{"team_id": r[0], "capacity": r[1], "task_id": r[2]}
+            for r in rows]
+
+
+async def insert_rescue_task(db: aiosqlite.Connection, *, group_id: int,
+                             team_id: int, node_id: int,
+                             observed_minute: int,
+                             dispatch_minute: int) -> int:
+    """登记一条进行中救援任务（调用方负责事务与全部受理校验），返回任务号。"""
+    async with db.execute(
+            """INSERT INTO rescue_tasks
+               (group_id, team_id, node_id, observed_minute, dispatch_minute,
+                status)
+               VALUES(?,?,?,?,?,'in_progress')""",
+            (group_id, team_id, node_id, observed_minute,
+             dispatch_minute)) as cur:
+        return int(cur.lastrowid)
+
+
+async def load_rescue_task(db: aiosqlite.Connection,
+                           task_id: int) -> dict | None:
+    async with db.execute(
+            """SELECT id, group_id, team_id, node_id, observed_minute,
+                      dispatch_minute, status, exit_id, delivery_minute
+               FROM rescue_tasks WHERE id=?""", (task_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"task_id": row[0], "group_id": row[1], "team_id": row[2],
+            "node_id": row[3], "observed_minute": row[4],
+            "dispatch_minute": row[5], "status": row[6],
+            "exit_id": row[7], "delivery_minute": row[8]}
+
+
+async def list_rescue_tasks(db: aiosqlite.Connection,
+                            status: str | None = None) -> list[dict]:
+    """按任务号升序列出救援任务，可按状态过滤。"""
+    if status is None:
+        query = ("SELECT id, group_id, team_id, node_id, observed_minute, "
+                 "dispatch_minute, status, exit_id, delivery_minute "
+                 "FROM rescue_tasks ORDER BY id")
+        params: tuple = ()
+    else:
+        query = ("SELECT id, group_id, team_id, node_id, observed_minute, "
+                 "dispatch_minute, status, exit_id, delivery_minute "
+                 "FROM rescue_tasks WHERE status=? ORDER BY id")
+        params = (status,)
+    async with db.execute(query, params) as cur:
+        rows = await cur.fetchall()
+    return [{"task_id": r[0], "group_id": r[1], "team_id": r[2],
+             "node_id": r[3], "observed_minute": r[4],
+             "dispatch_minute": r[5], "status": r[6],
+             "exit_id": r[7], "delivery_minute": r[8]} for r in rows]
+
+
+async def load_open_rescue_task_for_group(db: aiosqlite.Connection,
+                                          group_id: int) -> dict | None:
+    """返回该组当前进行中的救援任务（无则 None）。"""
+    async with db.execute(
+            """SELECT id, team_id FROM rescue_tasks
+               WHERE group_id=? AND status='in_progress'""",
+            (group_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"task_id": row[0], "team_id": row[1]}
+
+
+async def complete_rescue_task(db: aiosqlite.Connection, *, task_id: int,
+                               exit_id: int,
+                               delivery_minute: int) -> None:
+    """核销一条进行中救援任务（调用方负责事务与全部时序校验）。"""
+    await db.execute(
+        """UPDATE rescue_tasks SET status='completed', exit_id=?,
+           delivery_minute=? WHERE id=?""",
+        (exit_id, delivery_minute, task_id))
+
+
+async def load_group_rescue_map(db: aiosqlite.Connection) -> dict[int, dict]:
+    """返回 group_id -> 最新救援任务摘要（含完成后的实际出口与时刻）。
+
+    每组至多一条进行中任务、完成后也不会再开新任务（组已救援），因此
+    每组最多一行；该映射用于在 /plan 中单列人工救援信息。
+    """
+    async with db.execute(
+            """SELECT group_id, id, team_id, status, exit_id,
+                      delivery_minute
+               FROM rescue_tasks""") as cur:
+        rows = await cur.fetchall()
+    return {
+        row[0]: {"rescue_task_id": row[1], "rescue_team_id": row[2],
+                 "rescue_status": row[3],
+                 "rescued_exit_id": row[4],
+                 "delivery_minute": row[5]}
+        for row in rows}
 
 
 # --------------------------------------------------------------------------

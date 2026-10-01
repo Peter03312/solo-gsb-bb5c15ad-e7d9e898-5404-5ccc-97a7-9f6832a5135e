@@ -230,6 +230,83 @@ if __name__ == "__main__":
     show("再推进 6 分钟（待救援组不自动重排）", status, plan)
     summarize(plan)
 
+    # ---- 人工救援队：登记 / 派遣 / 结案核销 ----
+    status, payload = call("POST", "/rescue-teams",
+                           {"team_id": 1, "capacity": 10})
+    show("登记救援队 1（载员量 10）", status, payload)
+    status, payload = call("POST", "/rescue-teams",
+                           {"team_id": 1, "capacity": 20})
+    show("重复登记同编号队伍（预期 409）", status, payload)
+    call("POST", "/rescue-teams", {"team_id": 2, "capacity": 5})
+
+    # 派遣校验：节点不符 / 载员不足 / 所见分钟失步，均整次拒绝
+    status, payload = call("POST", "/rescue-tasks",
+                           {"group_id": 1, "team_id": 1, "node_id": 1,
+                            "observed_minute": 10})
+    show("派遣滞留节点不符（预期 409 NODE_MISMATCH）", status, payload)
+    status, payload = call("POST", "/rescue-tasks",
+                           {"group_id": 1, "team_id": 2, "node_id": 2,
+                            "observed_minute": 10})
+    show("组人数超队伍载员量（预期 409 TEAM_CAPACITY_EXCEEDED）",
+         status, payload)
+    status, payload = call("POST", "/rescue-tasks",
+                           {"group_id": 1, "team_id": 1, "node_id": 2,
+                            "observed_minute": 9})
+    show("所见分钟与当前分钟不一致（预期 409 OBSERVED_MINUTE_STALE）",
+         status, payload)
+
+    # 正式派遣：组1（节点2，所见当前分钟10）-> 救援队1
+    status, task = call("POST", "/rescue-tasks",
+                        {"group_id": 1, "team_id": 1, "node_id": 2,
+                         "observed_minute": 10})
+    show("派遣成功（返回任务号，组置 rescuing）", status, task)
+    task_id = task["task_id"]
+
+    status, payload = call("GET", "/rescue-teams")
+    show("救援队列表（队1 的 task_id 已回填）", status, payload)
+
+    # 同组重复派遣 / 救援中组的滞留报告，均被拒绝
+    status, payload = call("POST", "/rescue-tasks",
+                           {"group_id": 1, "team_id": 2, "node_id": 2,
+                            "observed_minute": 10})
+    show("同组重复派遣（预期 409 GROUP_RESCUE_IN_PROGRESS）",
+         status, payload)
+    status, payload = call("POST", "/groups/1/delay-report",
+                           {"node_id": 2, "recovery_minute": 12})
+    show("救援中的组提交滞留报告（预期 409 GROUP_RESCUING）",
+         status, payload)
+
+    # 结案时序校验
+    status, payload = call("POST", f"/rescue-tasks/{task_id}/completion",
+                           {"exit_id": 6, "delivery_minute": 12})
+    show("送达分钟晚于当前分钟（预期 409 DELIVERY_IN_FUTURE）",
+         status, payload)
+    status, payload = call("POST", f"/rescue-tasks/{task_id}/completion",
+                           {"exit_id": 7, "delivery_minute": 10})
+    show("送达出口非既有出口（预期 422）", status, payload)
+
+    # 推进到第 12 分钟并结案：实际由出口 6 在第 12 分钟送达
+    call("POST", "/tick", {"minutes": 2})
+    status, task = call("POST", f"/rescue-tasks/{task_id}/completion",
+                        {"exit_id": 6, "delivery_minute": 12})
+    show("结案核销成功（队伍释放，组置 rescued）", status, task)
+
+    status, payload = call("GET", f"/rescue-tasks/{task_id}")
+    show("查询任务当前状态（completed，含实际出口与时刻）", status, payload)
+    status, plan = call("GET", "/plan")
+    g1 = next(g for g in plan["groups"] if g["group_id"] == 1)
+    print("\n  组 1 最终编排：")
+    print(f"    status={g1['status']}，规划到达 exit_id={g1['exit_id']} / "
+          f"arrival_minute={g1['arrival_minute']}（人工送达不回写）")
+    print(f"    单列实际送达：rescued_exit_id={g1['rescued_exit_id']} / "
+          f"delivery_minute={g1['delivery_minute']}（晚于原截止也如实记录）")
+
+    status, payload = call("POST", f"/rescue-tasks/{task_id}/completion",
+                           {"exit_id": 6, "delivery_minute": 12})
+    show("重复结案（预期 409 TASK_ALREADY_COMPLETED）", status, payload)
+    status, payload = call("GET", "/rescue-tasks/999999")
+    show("未知任务号（预期 404）", status, payload)
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)

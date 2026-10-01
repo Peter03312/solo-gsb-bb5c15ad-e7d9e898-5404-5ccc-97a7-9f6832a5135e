@@ -20,6 +20,12 @@
   未抵达出口时受理；报告成功后保留已走前缀及时间，释放该组从当前分钟
   起的旧预约，从该节点、恢复分钟起重找截止前余程；无余程则标记待救援，
   不恢复旧预约。其他未出发组随之整体重排，其他已出发组路线与占用不变。
+* 待救援组可整组交接给登记在册的人工救援队：仅当所见分钟未变、组仍在
+  该节点待救援、人数不超载员量、队伍空闲且同组同队无进行中任务时派遣
+  受理；受理后组置救援中（保留前缀、不产生未来通道占用、不自动重排、
+  滞留报告对其拒绝）。结案须给出既有出口与不早于派遣、不晚于当前分钟的
+  实际送达分钟：核销后队伍空闲、组置已救援，实际出口与时刻单列，
+  不当作规划到达。无效编号、状态/时序冲突与并发抢占均整次拒绝。
 
 修订历史
 ========
@@ -46,8 +52,11 @@ from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
                       DelayReportAliasIn, DelayReportIn, GroupChangeOut,
                       GroupCorrectionIn, GroupIn, GroupPlanOut,
-                      PlanResponse, RevisionDetailOut, RevisionListOut,
-                      RevisionSummaryOut, ScenarioIn, StepOut)
+                      PlanResponse, RescueCompletionIn, RescueDispatchIn,
+                      RescueTaskListOut, RescueTaskOut, RescueTeamIn,
+                      RescueTeamListOut, RescueTeamOut, RevisionDetailOut,
+                      RevisionListOut, RevisionSummaryOut, ScenarioIn,
+                      StepOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -79,10 +88,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.2.0",
+    version="1.3.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
-                "支持封闭时段、容量管制时段、每分钟容量约束、增量重排与"
-                "现场节点滞留报告。",
+                "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
+                "现场节点滞留报告与人工救援队交接核销。",
     lifespan=lifespan,
 )
 
@@ -285,6 +294,24 @@ async def _delay_report_rejection(conn: aiosqlite.Connection,
             "node_id": node_id, "current_minute": minute_now,
             "recovery_minute": recovery_minute}
 
+    # 已交接给人工救援队（救援中）或已由人工结案送达（已救援）的组脱离
+    # 规划通道：既有节点滞留报告接口对其一律拒绝，不改编排
+    if status in ("rescuing", "rescued"):
+        open_task = await db.load_open_rescue_task_for_group(conn, group_id)
+        if status == "rescuing":
+            return 409, {
+                "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+                "message": "该组已交接人工救援队、正在救援中，节点滞留报告"
+                           "不再受理，整次拒绝",
+                "conflicts": [{**base, "reason": "GROUP_RESCUING",
+                               "rescue_task_id": open_task["task_id"],
+                               "rescue_team_id": open_task["team_id"]}]}
+        return 409, {
+            "error": "DELAY_REPORT_NOT_ACCEPTABLE",
+            "message": "该组已由人工救援队送达核销，不再接受节点滞留报告，"
+                       "整次拒绝",
+            "conflicts": [{**base, "reason": "GROUP_RESCUED"}]}
+
     if status not in ("fixed", "awaiting_rescue"):
         # scheduled / pending / failed：组未出发，不受理且不改编排
         return 409, {
@@ -486,6 +513,7 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
 async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     minute_now = await db.get_current_minute(conn)
     prefix_by_group = await db.load_delay_prefixes(conn)
+    rescue_by_group = await db.load_group_rescue_map(conn)
     async with conn.execute(
             """SELECT id, status, departure_minute, arrival_minute, exit_id,
                       fail_reason, fail_detail
@@ -502,12 +530,17 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
                 steps.append(StepOut(
                     edge_id=row[0], from_node=row[1], to_node=row[2],
                     enter_minute=row[3], exit_minute=row[4]))
+        rescue = rescue_by_group.get(gid, {})
         out.append(GroupPlanOut(
             group_id=gid, status=status, exit_id=exit_id,
             departure_minute=dep, arrival_minute=arr,
             route=[s.edge_id for s in steps], steps=steps,
             prefix_step_count=prefix_by_group.get(gid),
-            reason=reason, detail=detail))
+            reason=reason, detail=detail,
+            rescue_task_id=rescue.get("rescue_task_id"),
+            rescue_team_id=rescue.get("rescue_team_id"),
+            rescued_exit_id=rescue.get("rescued_exit_id"),
+            delivery_minute=rescue.get("delivery_minute")))
     return PlanResponse(current_minute=minute_now, groups=out)
 
 
@@ -519,7 +552,9 @@ def _plan_dump(plan: PlanResponse) -> dict:
 # diff 时逐字段比较的分组编排字段（route 由 steps 派生，仍单独列出以便阅读）
 _GROUP_DIFF_FIELDS = ("status", "exit_id", "departure_minute",
                       "arrival_minute", "route", "steps",
-                      "prefix_step_count", "reason", "detail")
+                      "prefix_step_count", "reason", "detail",
+                      "rescue_task_id", "rescue_team_id",
+                      "rescued_exit_id", "delivery_minute")
 
 
 def _diff_plans(before: PlanResponse,
@@ -652,14 +687,15 @@ async def correct_groups(corrections: list[GroupCorrectionIn],
             known_nodes |= {row[0] for row in await cur.fetchall()}
 
         # 存在性与"已出发"检查：并发时间推进使目标组在受理前出发时，
-        # 这里读到的即是 fixed；已被现场报告置为待救援的组同样已出发，
-        # 均整批拒绝
+        # 这里读到的即是 fixed；已被现场报告置为待救援、已交接人工救援
+        # （rescuing）或已由人工送达（rescued）的组同样不可纠正，均整批拒绝
         departed = []
         for c in corrections:
             row = existing.get(c.group_id)
             if row is None:
                 raise HTTPException(422, f"人群组 {c.group_id} 不存在")
-            if row[6] in ("fixed", "awaiting_rescue"):
+            if row[6] in ("fixed", "awaiting_rescue",
+                          "rescuing", "rescued"):
                 departed.append({"group_id": c.group_id, "status": row[6],
                                  "departure_minute": row[7],
                                  "arrival_minute": row[8]})
@@ -909,6 +945,359 @@ class TickIn(BaseModel):
     minutes: int = Field(1, gt=0, description="推进的分钟数（正整数）")
 
 
+# --------------------------------------------------------------------------
+# 人工救援队：登记 / 派遣 / 查询 / 结案核销
+# --------------------------------------------------------------------------
+
+def _dispatch_conflict(reason: str, payload: RescueDispatchIn,
+                       minute_now: int, *, status: str | None = None,
+                       group_size: int | None = None,
+                       team_capacity: int | None = None,
+                       expected_node: int | None = None,
+                       current_task_id: int | None = None
+                       ) -> JSONResponse:
+    """构造统一的派遣拒绝响应（HTTP 409 + error/message/conflicts）。"""
+    messages = {
+        "OBSERVED_MINUTE_STALE":
+            "所见当前分钟与实际当前分钟不一致（可能已被时间推进抢占），"
+            "整次拒绝",
+        "GROUP_NOT_AWAITING_RESCUE":
+            "该组当前不在待救援状态，不受理人工救援派遣，整次拒绝",
+        "GROUP_RESCUE_IN_PROGRESS":
+            "该组已有进行中的人工救援任务，同组只允许一项，整次拒绝",
+        "GROUP_ALREADY_RESCUED":
+            "该组已由人工救援队送达核销，不可再次派遣，整次拒绝",
+        "NODE_MISMATCH":
+            "滞留节点与该组待救援位置不符，整次拒绝",
+        "TEAM_CAPACITY_EXCEEDED":
+            "组人数超过救援队载员量，整次拒绝",
+        "TEAM_BUSY":
+            "救援队当前不空闲（已有进行中任务），同队只允许一项，整次拒绝",
+    }
+    conflict = {"group_id": payload.group_id, "team_id": payload.team_id,
+                "node_id": payload.node_id,
+                "observed_minute": payload.observed_minute,
+                "current_minute": minute_now, "reason": reason}
+    if status is not None:
+        conflict["status"] = status
+    if expected_node is not None:
+        conflict["expected_node_id"] = expected_node
+    if group_size is not None:
+        conflict["group_size"] = group_size
+    if team_capacity is not None:
+        conflict["team_capacity"] = team_capacity
+    if current_task_id is not None:
+        conflict["current_task_id"] = current_task_id
+    return JSONResponse(
+        status_code=409,
+        content={"error": "RESCUE_DISPATCH_NOT_ACCEPTABLE",
+                 "message": messages[reason], "conflicts": [conflict]})
+
+
+async def _apply_rescue_dispatch(conn: aiosqlite.Connection,
+                                 payload: RescueDispatchIn):
+    """受理一次人工救援派遣（调用方已持锁）。
+
+    仅当所见分钟未变、组仍在该节点待救援、人数不超载员量、队伍空闲且
+    同组同队均无进行中任务时受理。任一条件不满足整次拒绝（409），不改编排
+    与修订历史；无效组/队编号返回 422。受理后组置 rescuing，保留已走
+    通道前缀、不产生任何未来通道占用，与修订记录同一事务原子写入。
+    """
+    minute_now = await db.get_current_minute(conn)
+
+    async with conn.execute(
+            "SELECT status, size FROM groups WHERE id=?",
+            (payload.group_id,)) as cur:
+        group_row = await cur.fetchone()
+    if group_row is None:
+        raise HTTPException(422, f"人群组 {payload.group_id} 不存在")
+    status, group_size = group_row
+
+    async with conn.execute(
+            "SELECT capacity FROM rescue_teams WHERE id=?",
+            (payload.team_id,)) as cur:
+        team_row = await cur.fetchone()
+    if team_row is None:
+        raise HTTPException(422, f"救援队 {payload.team_id} 不存在")
+    team_capacity = team_row[0]
+
+    # 分钟未变：现场所见分钟须恰为当前分钟（时间推进并发抢占即在此拦截）
+    if payload.observed_minute != minute_now:
+        return _dispatch_conflict(
+            "OBSERVED_MINUTE_STALE", payload, minute_now, status=status)
+    # 组仍在待救援状态：救援中/已救援的组分别给出精确原因
+    if status == "rescuing":
+        open_group_task = await db.load_open_rescue_task_for_group(
+            conn, payload.group_id)
+        return _dispatch_conflict(
+            "GROUP_RESCUE_IN_PROGRESS", payload, minute_now, status=status,
+            current_task_id=(open_group_task or {}).get("task_id"))
+    if status == "rescued":
+        return _dispatch_conflict(
+            "GROUP_ALREADY_RESCUED", payload, minute_now, status=status)
+    if status != "awaiting_rescue":
+        return _dispatch_conflict(
+            "GROUP_NOT_AWAITING_RESCUE", payload, minute_now,
+            status=status)
+    # 组仍在该节点：待救援组的滞留节点取自其现场滞留报告
+    report = await db.load_delay_report(conn, payload.group_id)
+    if report is None:  # 防御：状态与报告表不一致不应出现
+        return _dispatch_conflict(
+            "NODE_MISMATCH", payload, minute_now, status=status)
+    if payload.node_id != report["node_id"]:
+        return _dispatch_conflict(
+            "NODE_MISMATCH", payload, minute_now, status=status,
+            expected_node=report["node_id"])
+    # 同组进行中任务（防御：awaiting_rescue 状态下不应存在，索引亦兜底）
+    open_group_task = await db.load_open_rescue_task_for_group(
+        conn, payload.group_id)
+    if open_group_task is not None:
+        return _dispatch_conflict(
+            "GROUP_RESCUE_IN_PROGRESS", payload, minute_now, status=status,
+            current_task_id=open_group_task["task_id"])
+    # 人数不超载员量
+    if group_size > team_capacity:
+        return _dispatch_conflict(
+            "TEAM_CAPACITY_EXCEEDED", payload, minute_now, status=status,
+            group_size=group_size, team_capacity=team_capacity)
+    # 队伍空闲：同队只允许一项进行中任务
+    async with conn.execute(
+            "SELECT id, group_id FROM rescue_tasks "
+            "WHERE team_id=? AND status='in_progress'",
+            (payload.team_id,)) as cur:
+        busy = await cur.fetchone()
+    if busy is not None:
+        return _dispatch_conflict(
+            "TEAM_BUSY", payload, minute_now, status=status,
+            current_task_id=busy[0])
+
+    before = await _build_plan_response(conn)
+    async with db.transaction(conn):
+        task_id = await db.insert_rescue_task(
+            conn, group_id=payload.group_id, team_id=payload.team_id,
+            node_id=payload.node_id, observed_minute=payload.observed_minute,
+            dispatch_minute=minute_now)
+        # 组标记救援中：已走前缀保留（route_steps 不动），不写入任何未来
+        # 通道占用；planning 字段（exit_id/arrival_minute）保持为空
+        await conn.execute(
+            "UPDATE groups SET status='rescuing', fail_reason=NULL, "
+            "fail_detail=NULL WHERE id=?", (payload.group_id,))
+        after = await _build_plan_response(conn)
+        await db.insert_revision(
+            conn, "rescue-dispatches",
+            {"task_id": task_id, "group_id": payload.group_id,
+             "team_id": payload.team_id, "node_id": payload.node_id,
+             "observed_minute": payload.observed_minute,
+             "dispatch_minute": minute_now},
+            _plan_dump(before), _plan_dump(after))
+    return JSONResponse(
+        status_code=201,
+        content=RescueTaskOut(
+            task_id=task_id, group_id=payload.group_id,
+            team_id=payload.team_id, node_id=payload.node_id,
+            observed_minute=payload.observed_minute,
+            dispatch_minute=minute_now, status="in_progress").model_dump())
+
+
+async def _apply_rescue_completion(conn: aiosqlite.Connection,
+                                   task_id: int,
+                                   payload: RescueCompletionIn):
+    """结案核销一次人工救援（调用方已持锁）。
+
+    实际送达分钟须不早于派遣分钟且不晚于当前分钟；送达出口须为既有出口。
+    成功后队伍立即空闲（任务置 completed），组标记 rescued，实际出口与
+    时刻单列（不写入规划到达字段），与修订记录同一事务原子写入。
+    """
+    minute_now = await db.get_current_minute(conn)
+    task = await db.load_rescue_task(conn, task_id)
+    if task is None:
+        raise HTTPException(404, f"救援任务 {task_id} 不存在")
+
+    async with conn.execute("SELECT 1 FROM exits WHERE node_id=?",
+                            (payload.exit_id,)) as cur:
+        if await cur.fetchone() is None:
+            raise HTTPException(
+                422, f"出口 {payload.exit_id} 不是当前场景的既有出口")
+
+    def _conflict(reason: str, message: str, extra: dict) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "RESCUE_COMPLETION_NOT_ACCEPTABLE",
+                "message": message,
+                "conflicts": [{
+                    "task_id": task_id, "group_id": task["group_id"],
+                    "team_id": task["team_id"], "status": task["status"],
+                    "dispatch_minute": task["dispatch_minute"],
+                    "current_minute": minute_now,
+                    "exit_id": payload.exit_id,
+                    "delivery_minute": payload.delivery_minute,
+                    "reason": reason, **extra}]})
+
+    if task["status"] != "in_progress":
+        return _conflict(
+            "TASK_ALREADY_COMPLETED",
+            "该救援任务已结案核销，不可重复结案，整次拒绝",
+            {"completed_exit_id": task["exit_id"],
+             "completed_delivery_minute": task["delivery_minute"]})
+    if payload.delivery_minute < task["dispatch_minute"]:
+        return _conflict(
+            "DELIVERY_BEFORE_DISPATCH",
+            "实际送达分钟早于派遣分钟，时序冲突，整次拒绝", {})
+    if payload.delivery_minute > minute_now:
+        return _conflict(
+            "DELIVERY_IN_FUTURE",
+            "实际送达分钟晚于当前分钟，时序冲突，整次拒绝", {})
+
+    before = await _build_plan_response(conn)
+    async with db.transaction(conn):
+        await db.complete_rescue_task(
+            conn, task_id=task_id, exit_id=payload.exit_id,
+            delivery_minute=payload.delivery_minute)
+        # 组标记已救援：规划到达字段（exit_id/arrival_minute）保持为空，
+        # 人工送达不当作规划到达；实际出口与时刻仅由救援字段单列
+        await conn.execute(
+            "UPDATE groups SET status='rescued' WHERE id=?",
+            (task["group_id"],))
+        after = await _build_plan_response(conn)
+        await db.insert_revision(
+            conn, "rescue-completions",
+            {"task_id": task_id, "group_id": task["group_id"],
+             "team_id": task["team_id"], "exit_id": payload.exit_id,
+             "delivery_minute": payload.delivery_minute,
+             "dispatch_minute": task["dispatch_minute"]},
+            _plan_dump(before), _plan_dump(after))
+    task.update(status="completed", exit_id=payload.exit_id,
+                delivery_minute=payload.delivery_minute)
+    return RescueTaskOut(**task)
+
+
+@app.post("/rescue-teams", tags=["人工救援"],
+          response_model=RescueTeamOut, status_code=201,
+          responses={409: {"description": "救援队编号已登记，整次拒绝"}})
+async def register_rescue_team(payload: RescueTeamIn, request: Request):
+    """登记一支人工救援队：唯一编号 + 正整数载员量。
+
+    编号重复返回 409 ``RESCUE_TEAM_ALREADY_REGISTERED``，整次拒绝、不产生
+    修订。队伍登记不改变编排；是否空闲由其有无进行中任务决定。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        async with conn.execute(
+                "SELECT 1 FROM rescue_teams WHERE id=?",
+                (payload.team_id,)) as cur:
+            if await cur.fetchone() is not None:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "RESCUE_TEAM_ALREADY_REGISTERED",
+                        "message": f"救援队 {payload.team_id} 已登记，"
+                                   f"重复登记整次拒绝",
+                        "conflicts": [{"team_id": payload.team_id,
+                                       "capacity": payload.capacity,
+                                       "reason": "DUPLICATE_TEAM_ID"}]})
+        async with db.transaction(conn):
+            await db.insert_rescue_team(
+                conn, team_id=payload.team_id, capacity=payload.capacity)
+        return RescueTeamOut(team_id=payload.team_id,
+                             capacity=payload.capacity, task_id=None)
+
+
+@app.get("/rescue-teams", tags=["人工救援"],
+         response_model=RescueTeamListOut)
+async def list_rescue_teams(request: Request):
+    """列出全部人工救援队（含载员量与当前进行中任务编号；空闲任务号为 null）。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        teams = await db.load_rescue_teams(conn)
+    return RescueTeamListOut(
+        current_minute=minute_now,
+        teams=[RescueTeamOut(**t) for t in teams])
+
+
+@app.post("/rescue-tasks", tags=["人工救援"],
+          response_model=RescueTaskOut, status_code=201,
+          responses={
+              409: {"description": "分钟失步/组状态或节点不符/超载/队伍忙，"
+                                   "整次拒绝"},
+              422: {"description": "无效组号或队号"}})
+async def dispatch_rescue(payload: RescueDispatchIn, request: Request):
+    """现场指挥把一个**待救援**组交接给人工救援队。
+
+    请求体给出组号、队号、滞留节点与所见当前分钟。仅当所见分钟未变、
+    组仍在该节点处于 ``awaiting_rescue``、组人数不超队伍载员量、队伍空闲
+    且同组同队均无进行中任务时受理，返回任务号（201）。受理后组置
+    ``rescuing``：保留已走通道前缀、不产生未来通道占用，时间推进不自动
+    重排该组，其既有节点滞留报告接口被拒绝（409
+    ``GROUP_RESCUING``）。任一条件不符返回 409
+    ``RESCUE_DISPATCH_NOT_ACCEPTABLE``（``conflicts[0].reason`` 给出
+    OBSERVED_MINUTE_STALE / GROUP_NOT_AWAITING_RESCUE / NODE_MISMATCH /
+    GROUP_RESCUE_IN_PROGRESS / TEAM_CAPACITY_EXCEEDED / TEAM_BUSY），
+    整次拒绝、不改编排与修订；无效组/队编号返回 422。成功派遣原子写入
+    一条 ``rescue-dispatches`` 修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _apply_rescue_dispatch(conn, payload)
+
+
+@app.get("/rescue-tasks", tags=["人工救援"],
+         response_model=RescueTaskListOut)
+async def list_rescue_tasks(request: Request,
+                            status: str | None = None):
+    """列出全部救援任务（按任务号升序），可加 ``?status=in_progress`` 或
+    ``?status=completed`` 过滤；其他状态值返回 422。"""
+    if status is not None and status not in ("in_progress", "completed"):
+        raise HTTPException(
+            422, "status 仅支持 in_progress 或 completed")
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        tasks = await db.list_rescue_tasks(conn, status)
+    return RescueTaskListOut(
+        current_minute=minute_now,
+        tasks=[RescueTaskOut(**t) for t in tasks])
+
+
+@app.get("/rescue-tasks/{task_id}", tags=["人工救援"],
+         response_model=RescueTaskOut,
+         responses={404: {"description": "救援任务不存在"}})
+async def get_rescue_task(task_id: int, request: Request):
+    """按任务号查询救援任务当前状态（in_progress/completed 及结案信息）。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        task = await db.load_rescue_task(conn, task_id)
+    if task is None:
+        raise HTTPException(404, f"救援任务 {task_id} 不存在")
+    return RescueTaskOut(**task)
+
+
+@app.post("/rescue-tasks/{task_id}/completion", tags=["人工救援"],
+          response_model=RescueTaskOut,
+          responses={
+              409: {"description": "任务已结案或送达分钟时序冲突，整次拒绝"},
+              404: {"description": "救援任务不存在"},
+              422: {"description": "出口编号非当前场景既有出口"}})
+async def complete_rescue(task_id: int, payload: RescueCompletionIn,
+                          request: Request):
+    """人工救援队结案核销：提交任务号、**既有出口编号**与实际送达分钟。
+
+    送达分钟须不早于派遣分钟且不晚于当前分钟（晚于该组原规划截止也如实
+    记录）。成功后任务置 completed、队伍立即空闲，组置 ``rescued``，实际
+    出口与送达时刻在任务与编排中单列（``rescued_exit_id`` /
+    ``delivery_minute``），**不**回写为规划到达（``exit_id`` /
+    ``arrival_minute`` 保持为空）。任务不存在 404；出口非既有出口 422；
+    任务已结案（``TASK_ALREADY_COMPLETED``）、送达早于派遣
+    （``DELIVERY_BEFORE_DISPATCH``）或晚于当前分钟（``DELIVERY_IN_FUTURE``）
+    返回 409 ``RESCUE_COMPLETION_NOT_ACCEPTABLE``，整次拒绝。成功结案原子
+    写入一条 ``rescue-completions`` 修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        return await _apply_rescue_completion(conn, task_id, payload)
+
+
 @app.post("/tick", tags=["时间"], response_model=PlanResponse)
 async def advance_minute(request: Request, payload: TickIn | None = None):
     """推进当前分钟（默认 +1，可传 {"minutes": n}）。
@@ -916,8 +1305,10 @@ async def advance_minute(request: Request, payload: TickIn | None = None):
     推进时，旧计划中出发分钟已过（< 新当前分钟）的组视为已经出发，
     路线与占用立即固定、不参与重排；其余未出发组再按新当前分钟整体重排
     （新计划允许在当前分钟立即出发）。被现场报告置为待救援
-    （awaiting_rescue）的组不参与重排，时间推进不会自动为其寻找余程，
-    只能由新的节点滞留报告携带新的恢复分钟重新受理。
+    （awaiting_rescue）的组、已交接人工救援队（rescuing）与已由人工结案
+    送达（rescued）的组均不参与重排：待救援组只能由新的节点滞留报告携带
+    新的恢复分钟重新受理；救援中的组由人工救援队结案核销，时间推进不会
+    自动为其寻找余程。
     """
     conn = request.app.state.db
     delta = payload.minutes if payload is not None else 1
