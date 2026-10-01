@@ -44,6 +44,15 @@ def summarize(plan):
             print(f"  组 {g['group_id']:>2} [待救援    ] "
                   f"滞留于已走前缀（{g['prefix_step_count']} 段，"
                   f"通道序列 {g['route']}）原因 {g['reason']}：{g['detail']}")
+        elif g["status"] == "rescuing":
+            print(f"  组 {g['group_id']:>2} [救援中    ] 任务 "
+                  f"{g['rescue_task_id']}，保留已走前缀（{g['route']}），"
+                  f"不产生未来通道占用")
+        elif g["status"] == "rescued":
+            print(f"  组 {g['group_id']:>2} [已救援    ] 任务 "
+                  f"{g['rescue_task_id']} 已由出口 {g['rescue_exit_id']} "
+                  f"第 {g['rescue_arrival_minute']} 分钟人工送达"
+                  "（单列记录，不计作规划到达）")
         else:
             print(f"  组 {g['group_id']:>2} [{g['status']:>9}] "
                   f"原因 {g['reason']}：{g['detail']}")
@@ -229,6 +238,88 @@ if __name__ == "__main__":
     status, plan = call("POST", "/tick", {"minutes": 6})
     show("再推进 6 分钟（待救援组不自动重排）", status, plan)
     summarize(plan)
+
+    # ---- 人工救援队：登记 / 派遣 / 结案核销 ----
+    status, payload = call("POST", "/rescue-teams",
+                           {"id": 9, "capacity": 12})
+    show("登记人工救援队 9（载员量 12）", status, payload)
+    # 重复登记：409 整次拒绝
+    status, payload = call("POST", "/rescue-teams",
+                           {"id": 9, "capacity": 20})
+    show("重复登记救援队 9（预期 409）", status, payload)
+
+    status, payload = call("GET", "/rescue-teams")
+    show("救援队列表（busy 由进行中任务派生）", status, payload)
+
+    # 派遣的全部冲突：所见分钟已变 / 滞留节点不符 / 人数超载
+    status, payload = call("POST", "/rescue-dispatches",
+                           {"group_id": 1, "team_id": 9, "node_id": 2,
+                            "observed_minute": 9})
+    show("派遣时所见分钟与当前分钟不一致（预期 409 MINUTE_CHANGED）",
+         status, payload)
+    status, payload = call("POST", "/rescue-dispatches",
+                           {"group_id": 1, "team_id": 9, "node_id": 5,
+                            "observed_minute": 10})
+    show("派遣节点与滞留节点不符（预期 409 NODE_MISMATCH）",
+         status, payload)
+    call("POST", "/rescue-teams", {"id": 8, "capacity": 5})
+    status, payload = call("POST", "/rescue-dispatches",
+                           {"group_id": 1, "team_id": 8, "node_id": 2,
+                            "observed_minute": 10})
+    show("组 10 人超过队 8 载员量 5（预期 409 TEAM_CAPACITY_EXCEEDED）",
+         status, payload)
+
+    # 正式派遣：组 1 保留已走前缀、进入救援中，不产生未来通道占用
+    status, payload = call("POST", "/rescue-dispatches",
+                           {"group_id": 1, "team_id": 9, "node_id": 2,
+                            "observed_minute": 10})
+    show("派遣组 1 给队 9（受理，返回任务号）", status, payload)
+    task_id = payload["task_id"]
+    summarize(payload["plan"])
+
+    # 同组再派给空闲的队 8：组已有进行中任务 -> 409
+    status, payload = call("POST", "/rescue-dispatches",
+                           {"group_id": 1, "team_id": 8, "node_id": 2,
+                            "observed_minute": 10})
+    show("同组重复派遣（预期 409 GROUP_ALREADY_BEING_RESCUED）",
+         status, payload)
+    # 救援中组的节点滞留报告被拒绝
+    status, payload = call("POST", "/groups/1/delay-report",
+                           {"node_id": 2, "recovery_minute": 10})
+    show("救援中组的滞留报告（预期 409 GROUP_BEING_RESCUED）",
+         status, payload)
+    status, payload = call("GET", "/rescue-tasks")
+    show("任务列表（任务进行中）", status, payload)
+
+    # 结案时序：早于派遣分钟、晚于当前分钟、非既有出口均 422
+    status, payload = call(
+        "POST", f"/rescue-tasks/{task_id}/complete",
+        {"exit_id": 6, "delivery_minute": 9})
+    show("送达分钟早于派遣分钟（预期 422）", status, payload)
+    status, payload = call(
+        "POST", f"/rescue-tasks/{task_id}/complete",
+        {"exit_id": 6, "delivery_minute": 11})
+    show("送达分钟晚于当前分钟（预期 422）", status, payload)
+    status, payload = call(
+        "POST", f"/rescue-tasks/{task_id}/complete",
+        {"exit_id": 99, "delivery_minute": 10})
+    show("送达出口不是既有出口（预期 422）", status, payload)
+
+    # 正式结案：第 10 分钟由出口 6 送达 -> 释放队伍、组 rescued，
+    # 实际出口与时刻单列，人工送达不计作规划到达
+    status, payload = call(
+        "POST", f"/rescue-tasks/{task_id}/complete",
+        {"exit_id": 6, "delivery_minute": 10})
+    show("结案核销：第 10 分钟出口 6 送达", status, payload)
+    summarize(payload["plan"])
+
+    # 重复结案 409；已救援组滞留报告 409；队伍释放后列表可见
+    status, payload = call(
+        "POST", f"/rescue-tasks/{task_id}/complete",
+        {"exit_id": 6, "delivery_minute": 10})
+    show("重复结案（预期 409 RESCUE_TASK_NOT_ACTIVE）", status, payload)
+    status, payload = call("GET", "/rescue-teams")
+    show("结案后救援队 9 已释放（busy=false）", status, payload)
 
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")

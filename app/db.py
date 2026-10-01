@@ -47,13 +47,20 @@ CREATE TABLE IF NOT EXISTS groups (
     earliest_departure INTEGER NOT NULL,
     priority           INTEGER NOT NULL,
     deadline           INTEGER NOT NULL,
-    -- pending | scheduled | fixed | failed | awaiting_rescue
+    -- pending | scheduled | fixed | failed | awaiting_rescue |
+    -- rescuing（人工救援中） | rescued（人工救援队已送达核销）
     status             TEXT NOT NULL,
     departure_minute   INTEGER,
     arrival_minute     INTEGER,
     exit_id            INTEGER,
     fail_reason        TEXT,
-    fail_detail        TEXT
+    fail_detail        TEXT,
+    -- 人工救援交接：派遣后关联进行中/已核销任务号；结案后另列实际出口与
+    -- 实际送达分钟。人工送达不计入规划到达（exit_id/arrival_minute 保持
+    -- 既有规划语义，晚于原截止也如实记录于这两列）
+    rescue_task_id         INTEGER,
+    rescue_exit_id         INTEGER,
+    rescue_arrival_minute  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS route_steps (
@@ -80,6 +87,38 @@ CREATE TABLE IF NOT EXISTS delay_reports (
     prefix_step_count INTEGER NOT NULL
 );
 
+-- 人工救援队：唯一正整数编号登记，capacity 为正整数载员量（一次进行中
+-- 任务所载人数不得超过它）。是否空闲由 rescue_tasks 中是否存在
+-- status='dispatched' 的任务派生，不单独存状态列。
+CREATE TABLE IF NOT EXISTS rescue_teams (
+    id       INTEGER PRIMARY KEY,
+    capacity INTEGER NOT NULL
+);
+
+-- 人工救援任务（派遣/核销）：
+-- * 派遣受理要求组在 node_id 待救援、所见分钟 == 当前分钟、人数不超载员量、
+--   队伍空闲；组进入 rescuing，保留已走前缀，不产生未来通道占用；
+-- * 结案提交既有出口与实际送达分钟（不早于派遣分钟、不晚于当前分钟）：
+--   组置 rescued 并单列实际出口/时刻，队伍随之释放。
+-- 同组、同队各只允许一项进行中任务：由下方两个部分唯一索引强制。
+CREATE TABLE IF NOT EXISTS rescue_tasks (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id            INTEGER NOT NULL,
+    team_id             INTEGER NOT NULL,
+    node_id             INTEGER NOT NULL,  -- 派遣时的滞留节点
+    observed_minute     INTEGER NOT NULL,  -- 派遣提交时所见当前分钟
+    dispatch_minute     INTEGER NOT NULL,  -- 派遣受理时的当前分钟
+    -- dispatched（进行中） | delivered（已核销送达）
+    status              TEXT NOT NULL,
+    exit_id             INTEGER,           -- 结案时的实际出口（既有出口）
+    delivery_minute     INTEGER            -- 结案时的实际送达分钟
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_task_per_group
+    ON rescue_tasks(group_id) WHERE status='dispatched';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_task_per_team
+    ON rescue_tasks(team_id) WHERE status='dispatched';
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
 -- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
@@ -88,7 +127,8 @@ CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
                                       -- closures | capacity-controls |
-                                      -- delay-reports | tick
+                                      -- delay-reports | rescue-dispatches |
+                                      -- rescue-completions | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
     plan_before TEXT NOT NULL,        -- JSON：提交前完整编排（PlanResponse）
@@ -99,6 +139,16 @@ CREATE TABLE IF NOT EXISTS revisions (
 
 async def init_db(db: aiosqlite.Connection) -> None:
     await db.executescript(SCHEMA)
+    # 旧版本库升级：groups 表补人工救援字段（新建库已由 SCHEMA 含这些列）。
+    async with db.execute("PRAGMA table_info(groups)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    for column, ddl in (
+            ("rescue_task_id", "ALTER TABLE groups ADD COLUMN rescue_task_id INTEGER"),
+            ("rescue_exit_id", "ALTER TABLE groups ADD COLUMN rescue_exit_id INTEGER"),
+            ("rescue_arrival_minute",
+             "ALTER TABLE groups ADD COLUMN rescue_arrival_minute INTEGER")):
+        if column not in columns:
+            await db.execute(ddl)
     await db.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('current_minute', 0)")
     await db.commit()
@@ -107,10 +157,11 @@ async def init_db(db: aiosqlite.Connection) -> None:
 async def reset_db(db: aiosqlite.Connection) -> None:
     """清空全部业务表并归零当前分钟（调用方负责事务）。
 
-    修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
-    修订号继续全局递增。
+    人工救援队与其任务一并清空；修订历史（revisions 表）不在清空之列：
+    场景重置后旧修订仍可查询，修订号继续全局递增。
     """
-    for table in ("delay_reports", "route_steps", "groups", "closures",
+    for table in ("rescue_tasks", "rescue_teams", "delay_reports",
+                  "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
